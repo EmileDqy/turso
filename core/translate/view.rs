@@ -451,6 +451,19 @@ pub fn translate_drop_view(
         return Ok(());
     }
 
+    if is_materialized_view {
+        let mut dependent_views = resolver.with_schema(database_id, |s| {
+            s.get_dependent_materialized_views(&normalized_view_name)
+        });
+        if !dependent_views.is_empty() {
+            dependent_views.sort();
+            return Err(crate::LimboError::ParseError(format!(
+                "cannot drop materialized view \"{normalized_view_name}\": it has dependent materialized view(s): {}",
+                dependent_views.join(", ")
+            )));
+        }
+    }
+
     // If this is a materialized view, we need to destroy its btree as well
     // and also clean up the associated DBSP state table and index
     let dbsp_table_name = if is_materialized_view {

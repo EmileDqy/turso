@@ -1218,10 +1218,13 @@ impl Schema {
         let table_name = normalize_ident(table_name);
         let view_name = normalize_ident(view_name);
 
-        self.table_to_materialized_views
+        let dependent_views = self
+            .table_to_materialized_views
             .entry(table_name)
-            .or_insert_with(|| vec![])
-            .push(view_name);
+            .or_insert_with(|| vec![]);
+        if !dependent_views.contains(&view_name) {
+            dependent_views.push(view_name);
+        }
     }
 
     /// Get all materialized views that depend on a given table
@@ -1234,6 +1237,71 @@ impl Schema {
             .get(&table_name)
             .cloned()
             .unwrap_or_else(|| vec![])
+    }
+
+    /// Return all materialized views affected by `roots`, ordered so every
+    /// upstream view is committed before its downstream dependants.
+    pub fn materialized_view_commit_order(&self, roots: &[String]) -> Result<Vec<String>> {
+        let mut affected = HashSet::default();
+        let mut pending = VecDeque::new();
+
+        for root in roots {
+            let root = normalize_ident(root);
+            if self.incremental_views.contains_key(&root) && affected.insert(root.clone()) {
+                pending.push_back(root);
+            }
+        }
+
+        while let Some(source) = pending.pop_front() {
+            for dependant in self.get_dependent_materialized_views(&source) {
+                if self.incremental_views.contains_key(&dependant)
+                    && affected.insert(dependant.clone())
+                {
+                    pending.push_back(dependant);
+                }
+            }
+        }
+
+        let mut indegrees: HashMap<String, usize> =
+            affected.iter().map(|view| (view.clone(), 0)).collect();
+
+        for source in &affected {
+            for dependant in self.get_dependent_materialized_views(source) {
+                if let Some(indegree) = indegrees.get_mut(&dependant) {
+                    *indegree += 1;
+                }
+            }
+        }
+
+        let mut ready: Vec<String> = indegrees
+            .iter()
+            .filter_map(|(view, indegree)| (*indegree == 0).then_some(view.clone()))
+            .collect();
+        ready.sort_by(|a, b| b.cmp(a));
+
+        let mut order = Vec::with_capacity(affected.len());
+        while let Some(view) = ready.pop() {
+            order.push(view.clone());
+
+            for dependant in self.get_dependent_materialized_views(&view) {
+                let Some(indegree) = indegrees.get_mut(&dependant) else {
+                    continue;
+                };
+                *indegree -= 1;
+                if *indegree == 0 {
+                    ready.push(dependant);
+                    ready.sort_by(|a, b| b.cmp(a));
+                }
+            }
+        }
+
+        if order.len() != affected.len() {
+            return Err(crate::LimboError::ParseError(
+                "materialized view dependency cycle detected".to_string(),
+            ));
+        }
+
+        Ok(order)
     }
 
     /// Add a regular (non-materialized) view
@@ -1900,81 +1968,127 @@ impl Schema {
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
-        for (view_name, (sql, main_root)) in materialized_view_info {
-            // Look up the DBSP state root for this view
-            // If missing, it means version mismatch - skip this view
-            // Check if we have a compatible DBSP state root
-            let dbsp_state_root = if let Some(&root) = dbsp_state_roots.get(&view_name) {
-                root
-            } else {
-                tracing::warn!(
-                    "Materialized view '{}' has incompatible version or missing DBSP state table",
-                    view_name
-                );
-                // Track this as an incompatible view
-                self.incompatible_views.insert(view_name.clone());
-                // Use a dummy root page - the view won't be usable anyway
-                0
-            };
+        let mut pending: Vec<_> = materialized_view_info.into_iter().collect();
+        pending.sort_by(|a, b| a.0.cmp(&b.0));
 
-            // Look up the DBSP state index root (may not exist for older schemas)
-            let dbsp_state_index_root =
-                dbsp_state_index_roots.get(&view_name).copied().unwrap_or(0);
+        while !pending.is_empty() {
+            let pending_count = pending.len();
+            let mut deferred = Vec::new();
 
-            // Register the DBSP state index so integrity check can account for its pages.
-            if dbsp_state_index_root > 0 && dbsp_state_root > 0 {
-                let mut index = create_dbsp_state_index(dbsp_state_index_root);
-                let dbsp_table_name =
-                    format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
-                index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
-                index.table_name = dbsp_table_name;
-                if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
-                    if !e.to_string().contains("already exists") {
-                        return Err(e);
+            for (view_name, (sql, main_root)) in pending {
+                match self.populate_materialized_view(
+                    &view_name,
+                    &sql,
+                    main_root,
+                    &dbsp_state_roots,
+                    &dbsp_state_index_roots,
+                ) {
+                    Ok(()) => {}
+                    Err(LimboError::ParseError(message))
+                        if message.contains("not found in schema") =>
+                    {
+                        deferred.push((view_name, (sql, main_root)));
                     }
+                    Err(error) => return Err(error),
                 }
             }
 
-            // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(
-                &sql,
-                self,
-                main_root,
-                dbsp_state_root,
-                dbsp_state_index_root,
-            )?;
-            let referenced_tables = incremental_view.get_referenced_table_names();
-
-            // Create a BTreeTable for the materialized view
-            let cols = incremental_view.column_schema.flat_columns();
-            let logical_to_physical_map =
-                BTreeTable::build_logical_to_physical_map(&cols, &[], true);
-            let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
-                name: view_name.clone(),
-                root_page: main_root,
-                columns: cols,
-                primary_key_columns: vec![],
-                has_rowid: true,
-                is_strict: false,
-                has_autoincrement: false,
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                unique_sets: vec![],
-                has_virtual_columns: false,
-                logical_to_physical_map,
-                column_dependencies: Default::default(),
-            })));
-
-            // Only add to schema if compatible
-            if !self.incompatible_views.contains(&view_name) {
-                self.add_materialized_view(incremental_view, table, sql);
+            if deferred.len() == pending_count {
+                let mut names: Vec<_> = deferred
+                    .iter()
+                    .map(|(view_name, _)| view_name.as_str())
+                    .collect();
+                names.sort();
+                return Err(LimboError::ParseError(format!(
+                    "materialized view dependency cycle or missing source: {}",
+                    names.join(", ")
+                )));
             }
 
-            // Register dependencies regardless of compatibility
-            for table_name in referenced_tables {
-                self.add_materialized_view_dependency(&table_name, &view_name);
+            pending = deferred;
+        }
+
+        Ok(())
+    }
+
+    fn populate_materialized_view(
+        &mut self,
+        view_name: &str,
+        sql: &str,
+        main_root: i64,
+        dbsp_state_roots: &HashMap<String, i64>,
+        dbsp_state_index_roots: &HashMap<String, i64>,
+    ) -> Result<()> {
+        // Look up the DBSP state root for this view
+        // If missing, it means version mismatch - skip this view
+        // Check if we have a compatible DBSP state root
+        let dbsp_state_root = if let Some(&root) = dbsp_state_roots.get(view_name) {
+            root
+        } else {
+            tracing::warn!(
+                "Materialized view '{}' has incompatible version or missing DBSP state table",
+                view_name
+            );
+            // Track this as an incompatible view
+            self.incompatible_views.insert(view_name.to_string());
+            // Use a dummy root page - the view won't be usable anyway
+            0
+        };
+
+        // Look up the DBSP state index root (may not exist for older schemas)
+        let dbsp_state_index_root = dbsp_state_index_roots.get(view_name).copied().unwrap_or(0);
+
+        // Register the DBSP state index so integrity check can account for its pages.
+        if dbsp_state_index_root > 0 && dbsp_state_root > 0 {
+            let mut index = create_dbsp_state_index(dbsp_state_index_root);
+            let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
+            index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
+            index.table_name = dbsp_table_name;
+            if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
+                if !e.to_string().contains("already exists") {
+                    return Err(e);
+                }
             }
+        }
+
+        // Create the IncrementalView with all root pages
+        let incremental_view = IncrementalView::from_sql(
+            sql,
+            self,
+            main_root,
+            dbsp_state_root,
+            dbsp_state_index_root,
+        )?;
+        let referenced_tables = incremental_view.get_referenced_table_names();
+
+        // Create a BTreeTable for the materialized view
+        let cols = incremental_view.column_schema.flat_columns();
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&cols, &[], true);
+        let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
+            name: view_name.to_string(),
+            root_page: main_root,
+            columns: cols,
+            primary_key_columns: vec![],
+            has_rowid: true,
+            is_strict: false,
+            has_autoincrement: false,
+            foreign_keys: vec![],
+            check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
+            unique_sets: vec![],
+            has_virtual_columns: false,
+            logical_to_physical_map,
+            column_dependencies: Default::default(),
+        })));
+
+        // Only add to schema if compatible
+        if !self.incompatible_views.contains(view_name) {
+            self.add_materialized_view(incremental_view, table, sql.to_string());
+        }
+
+        // Register dependencies regardless of compatibility
+        for table_name in referenced_tables {
+            self.add_materialized_view_dependency(&table_name, view_name);
         }
         Ok(())
     }

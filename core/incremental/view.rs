@@ -110,6 +110,13 @@ impl ViewTransactionState {
         delta.delete(key, values);
     }
 
+    /// Append an already-computed delta from an upstream materialized view.
+    pub fn merge(&self, table_name: &str, incoming: &Delta) {
+        let mut deltas = self.table_deltas.borrow_mut();
+        let delta = deltas.entry(table_name.to_string()).or_default();
+        delta.merge(incoming);
+    }
+
     /// Clear all changes in the delta
     pub fn clear(&self) {
         self.table_deltas.borrow_mut().clear();
@@ -137,6 +144,8 @@ impl ViewTransactionState {
 pub struct AllViewsTxState {
     states: Rc<RefCell<HashMap<String, Arc<ViewTransactionState>>>>,
 }
+
+pub(crate) type AllViewsTxStateSnapshot = Vec<(String, ViewTransactionState)>;
 
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
@@ -173,6 +182,27 @@ impl AllViewsTxState {
     /// Clear all transaction states
     pub fn clear(&self) {
         self.states.borrow_mut().clear();
+    }
+
+    /// Capture the current transaction deltas so statement rollback can discard
+    /// only the deltas produced by the failed statement.
+    pub(crate) fn snapshot(&self) -> AllViewsTxStateSnapshot {
+        self.states
+            .borrow()
+            .iter()
+            .map(|(view_name, tx_state)| (view_name.clone(), tx_state.as_ref().clone()))
+            .collect()
+    }
+
+    /// Restore a previously captured transaction-delta snapshot.
+    pub(crate) fn restore(&self, snapshot: AllViewsTxStateSnapshot) {
+        let mut states = self.states.borrow_mut();
+        states.clear();
+        states.extend(
+            snapshot
+                .into_iter()
+                .map(|(view_name, tx_state)| (view_name, Arc::new(tx_state))),
+        );
     }
 
     /// Check if there are no transaction states
@@ -1371,7 +1401,8 @@ impl IncrementalView {
         delta_set.insert(table_name, single_row_delta);
 
         // Process through merge_delta
-        self.merge_delta(delta_set, pager)
+        let _ = return_if_io!(self.merge_delta(delta_set, pager));
+        Ok(IOResult::Done(()))
     }
 
     /// Extract rowid and values from a row
@@ -1405,18 +1436,17 @@ impl IncrementalView {
         &mut self,
         delta_set: DeltaSet,
         pager: Arc<crate::Pager>,
-    ) -> crate::Result<IOResult<()>> {
+    ) -> crate::Result<IOResult<Delta>> {
         // Early return if all deltas are empty
         if delta_set.is_empty() {
-            return Ok(IOResult::Done(()));
+            return Ok(IOResult::Done(Delta::new()));
         }
 
         // Use the circuit to process the deltas and write to btree
         let input_data = delta_set.into_map();
 
         // The circuit now handles all btree I/O internally with the provided pager
-        let _delta = return_if_io!(self.circuit.commit(input_data, pager));
-        Ok(IOResult::Done(()))
+        self.circuit.commit(input_data, pager)
     }
 }
 

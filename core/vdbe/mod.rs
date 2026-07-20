@@ -42,6 +42,7 @@ use crate::{
     alloc::DynAllocator,
     error::LimboError,
     function::FuncCtx,
+    incremental::view::AllViewsTxStateSnapshot,
     mvcc::{database::CommitStateMachine, MvccClock},
     numeric::Numeric,
     return_if_io,
@@ -786,6 +787,7 @@ pub struct ProgramState {
     pub(crate) is_active_write: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
+    view_transaction_states_when_stmt_started: Option<AllViewsTxStateSnapshot>,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
 }
@@ -848,6 +850,7 @@ impl ProgramState {
             uses_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
+            view_transaction_states_when_stmt_started: None,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             n_total_change: AtomicI64::new(0),
@@ -978,6 +981,7 @@ impl ProgramState {
         self.uses_subjournal = false;
         self.is_active_write = false;
         self.has_stmt_transaction = false;
+        self.view_transaction_states_when_stmt_started = None;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
         self.n_change.store(0, Ordering::SeqCst);
@@ -1130,6 +1134,8 @@ impl ProgramState {
         }
 
         self.has_stmt_transaction = true;
+        self.view_transaction_states_when_stmt_started =
+            Some(connection.view_transaction_states.snapshot());
 
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
@@ -1169,6 +1175,8 @@ impl ProgramState {
             return Ok(());
         }
         self.has_stmt_transaction = false;
+        let view_transaction_states_when_stmt_started =
+            self.view_transaction_states_when_stmt_started.take();
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
@@ -1244,6 +1252,10 @@ impl ProgramState {
                 // Always restore FK violation counters on statement rollback,
                 // regardless of whether a pager savepoint was opened.
                 // Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3243-3246).
+                if let Some(snapshot) = view_transaction_states_when_stmt_started {
+                    connection.view_transaction_states.restore(snapshot);
+                }
+
                 connection.fk_deferred_violations.store(
                     self.fk_deferred_violations_when_stmt_started
                         .load(Ordering::Acquire),
@@ -1886,9 +1898,8 @@ impl Program {
                     // Not a rollback - proceed with processing
                     let schema = self.connection.schema.read();
 
-                    // Collect materialized views - they should all have storage
-                    let mut views = Vec::new();
-                    for view_name in self.connection.view_transaction_states.get_view_names() {
+                    let roots = self.connection.view_transaction_states.get_view_names();
+                    for view_name in &roots {
                         if let Some(view_mutex) = schema.get_materialized_view(&view_name) {
                             let view = view_mutex.lock();
                             let root_page = view.get_root_page();
@@ -1899,10 +1910,10 @@ impl Program {
                                 "Materialized view should have a root page",
                                 { "view_name": view_name }
                             );
-
-                            views.push(view_name);
                         }
                     }
+
+                    let views = schema.materialized_view_commit_order(&roots)?;
 
                     state.view_delta_state = ViewDeltaCommitState::Processing {
                         views,
@@ -1924,12 +1935,16 @@ impl Program {
 
                     let view_name = &views[*current_index];
 
-                    let table_deltas = self
-                        .connection
-                        .view_transaction_states
-                        .get(view_name)
-                        .expect("view should have transaction state")
-                        .get_table_deltas();
+                    let Some(view_transaction_state) =
+                        self.connection.view_transaction_states.get(view_name)
+                    else {
+                        state.view_delta_state = ViewDeltaCommitState::Processing {
+                            views: views.clone(),
+                            current_index: current_index + 1,
+                        };
+                        continue;
+                    };
+                    let table_deltas = view_transaction_state.get_table_deltas();
 
                     let schema = self.connection.schema.read();
                     if let Some(view_mutex) = schema.get_materialized_view(view_name) {
@@ -1943,7 +1958,21 @@ impl Program {
 
                         // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
                         match view.merge_delta(delta_set, pager.clone())? {
-                            IOResult::Done(_) => {
+                            IOResult::Done(output_delta) => {
+                                let dependent_views =
+                                    schema.get_dependent_materialized_views(view_name);
+                                drop(view);
+                                drop(schema);
+
+                                if !output_delta.is_empty() {
+                                    for dependent_view in dependent_views {
+                                        self.connection
+                                            .view_transaction_states
+                                            .get_or_create(&dependent_view)
+                                            .merge(view_name, &output_delta);
+                                    }
+                                }
+
                                 // Move to next view
                                 state.view_delta_state = ViewDeltaCommitState::Processing {
                                     views: views.clone(),

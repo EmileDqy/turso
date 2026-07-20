@@ -1,0 +1,79 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+test matview-dependent-chain-propagates-inserts-updates-and-deletes {
+    CREATE TABLE raw_events(id INTEGER PRIMARY KEY, event_type TEXT, path TEXT);
+    CREATE MATERIALIZED VIEW file_events AS
+    SELECT id, event_type, path FROM raw_events WHERE path IS NOT NULL;
+    CREATE MATERIALIZED VIEW edited_files AS
+    SELECT id, path FROM file_events WHERE event_type = 'file_edited';
+    INSERT INTO raw_events VALUES
+        (1, 'file_edited', 'src/lib.rs'),
+        (2, 'file_focused', 'src/main.rs');
+    SELECT * FROM edited_files ORDER BY id;
+    UPDATE raw_events SET event_type = 'file_edited' WHERE id = 2;
+    SELECT * FROM edited_files ORDER BY id;
+    DELETE FROM raw_events WHERE id = 1;
+    SELECT * FROM edited_files ORDER BY id;
+}
+expect {
+    1|src/lib.rs
+    1|src/lib.rs
+    2|src/main.rs
+    2|src/main.rs
+}
+
+test matview-dependent-diamond-accumulates-both-parents {
+    CREATE TABLE raw_values(id INTEGER PRIMARY KEY, value INTEGER);
+    CREATE MATERIALIZED VIEW positive_values AS
+    SELECT id, value FROM raw_values WHERE value > 0;
+    CREATE MATERIALIZED VIEW even_values AS
+    SELECT id, value FROM raw_values WHERE value % 2 = 0;
+    CREATE MATERIALIZED VIEW positive_even_values AS
+    SELECT positive_values.id, positive_values.value
+    FROM positive_values
+    JOIN even_values ON positive_values.id = even_values.id;
+    INSERT INTO raw_values VALUES (1, 2), (2, 3), (3, -2);
+    SELECT * FROM positive_even_values ORDER BY id;
+    UPDATE raw_values SET value = 4 WHERE id = 2;
+    SELECT * FROM positive_even_values ORDER BY id;
+    DELETE FROM raw_values WHERE id = 1;
+    SELECT * FROM positive_even_values ORDER BY id;
+}
+expect {
+    1|2
+    1|2
+    2|4
+    2|4
+}
+
+test matview-dependent-aggregation-propagates-retractions {
+    CREATE TABLE raw_events(id INTEGER PRIMARY KEY, event_type TEXT, path TEXT);
+    CREATE MATERIALIZED VIEW edits AS
+    SELECT id, path FROM raw_events WHERE event_type = 'file_edited';
+    CREATE MATERIALIZED VIEW edit_counts AS
+    SELECT path, COUNT(*) AS count FROM edits GROUP BY path;
+    INSERT INTO raw_events VALUES
+        (1, 'file_edited', 'src/lib.rs'),
+        (2, 'file_edited', 'src/lib.rs'),
+        (3, 'file_focused', 'src/lib.rs');
+    SELECT * FROM edit_counts ORDER BY path;
+    DELETE FROM raw_events WHERE id = 1;
+    SELECT * FROM edit_counts ORDER BY path;
+}
+expect {
+    src/lib.rs|2
+    src/lib.rs|1
+}
+
+test matview-dependent-upstream-drop-is-rejected {
+    CREATE TABLE raw_events(id INTEGER PRIMARY KEY, event_type TEXT);
+    CREATE MATERIALIZED VIEW normalized_events AS SELECT * FROM raw_events;
+    CREATE MATERIALIZED VIEW file_edits AS
+    SELECT * FROM normalized_events WHERE event_type = 'file_edited';
+    DROP VIEW normalized_events;
+}
+expect error {
+    cannot drop materialized view "normalized_events": it has dependent materialized view\(s\): file_edits
+}
