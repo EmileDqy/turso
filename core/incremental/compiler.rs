@@ -849,7 +849,7 @@ fn try_inline_ctes(
     cte_map: &HashMap<String, Arc<LogicalPlan>>,
 ) -> Result<LogicalPlan> {
     match plan {
-        LogicalPlan::WithCTE(with_cte) => {
+        LogicalPlan::WithCTE(_) => {
             // Nested WITH blocks need to be fully inlined
             inline_ctes(plan, cte_map)
         }
@@ -1107,7 +1107,7 @@ impl DbspCompiler {
     /// Compile a logical plan to a DBSP circuit
     pub fn compile(mut self, plan: &LogicalPlan) -> Result<DbspCircuit> {
         // First, inline any CTEs in the plan
-        let inlined_plan = inline_ctes(plan, &HashMap::new())?;
+        let inlined_plan = inline_ctes(plan, &HashMap::default())?;
         let root_id = self.compile_plan(&inlined_plan)?;
         let output_schema = inlined_plan.schema().clone();
         self.circuit.set_root(root_id, output_schema);

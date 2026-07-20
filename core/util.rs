@@ -1855,7 +1855,7 @@ pub fn extract_view_columns(
     select_stmt: &ast::Select,
     schema: &Schema,
 ) -> Result<ViewColumnSchema> {
-    extract_view_columns_internal(select_stmt, schema, &HashMap::new())
+    extract_view_columns_internal(select_stmt, schema, &HashMap::default())
 }
 
 /// Internal helper that accepts pre-existing CTE schemas for handling chained CTEs
