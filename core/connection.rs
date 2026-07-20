@@ -36,6 +36,7 @@ use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::cmp::Ordering as CmpOrdering;
+use std::collections::VecDeque;
 use std::fmt::Display;
 use std::ops::Deref;
 #[cfg(feature = "simulator")]
@@ -431,6 +432,10 @@ pub struct Connection {
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
     pub(crate) view_transaction_states: AllViewsTxState,
+    /// Runtime routing for logical materialized-view names. A replacement view
+    /// keeps receiving its own upstream deltas, but its output is delivered to
+    /// the dependants compiled against the logical view name.
+    pub(crate) materialized_view_routes: RwLock<HashMap<String, String>>,
     /// Connection-level metrics aggregation
     pub metrics: RwLock<ConnectionMetrics>,
     /// Greater than zero if connection executes a program within a program
@@ -557,6 +562,276 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    fn validate_materialized_view_contract(
+        schema: &Schema,
+        logical_view: &str,
+        physical_view: &str,
+    ) -> Result<(String, String)> {
+        let logical_view = crate::util::normalize_ident(logical_view);
+        let physical_view = crate::util::normalize_ident(physical_view);
+
+        if !schema.is_materialized_view(&logical_view) {
+            return Err(LimboError::ParseError(format!(
+                "no such logical materialized view: {logical_view}"
+            )));
+        }
+        if !schema.is_materialized_view(&physical_view) {
+            return Err(LimboError::ParseError(format!(
+                "no such replacement materialized view: {physical_view}"
+            )));
+        }
+
+        let logical_table = schema.get_btree_table(&logical_view).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "materialized view {logical_view} has no backing table"
+            ))
+        })?;
+        let physical_table = schema.get_btree_table(&physical_view).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "materialized view {physical_view} has no backing table"
+            ))
+        })?;
+        let logical_columns = logical_table.columns();
+        let physical_columns = physical_table.columns();
+
+        if logical_columns.len() != physical_columns.len() {
+            return Err(LimboError::ParseError(format!(
+                "materialized view replacement breaks the data contract: {logical_view} has {} columns but {physical_view} has {}",
+                logical_columns.len(),
+                physical_columns.len()
+            )));
+        }
+
+        for (index, (logical_column, physical_column)) in logical_columns
+            .iter()
+            .zip(physical_columns.iter())
+            .enumerate()
+        {
+            if logical_column.name != physical_column.name
+                || logical_column.affinity() != physical_column.affinity()
+            {
+                return Err(LimboError::ParseError(format!(
+                    "materialized view replacement breaks column {} of the data contract: {:?} {:?} != {:?} {:?}",
+                    index + 1,
+                    logical_column.name,
+                    logical_column.affinity(),
+                    physical_column.name,
+                    physical_column.affinity()
+                )));
+            }
+        }
+
+        Ok((logical_view, physical_view))
+    }
+
+    /// Stage the snapshot correction that moves existing downstream state from
+    /// the current physical view to a compatible replacement. The caller must
+    /// commit or roll back the surrounding SQL transaction before activating
+    /// the new runtime route.
+    pub fn stage_materialized_view_replacement(
+        &self,
+        logical_view: &str,
+        current_view: &str,
+        current_rows: Vec<(i64, Vec<Value>)>,
+        replacement_view: &str,
+        replacement_rows: Vec<(i64, Vec<Value>)>,
+    ) -> Result<usize> {
+        if self.get_auto_commit() {
+            return Err(LimboError::ParseError(
+                "materialized view replacement must be staged inside an explicit transaction"
+                    .to_string(),
+            ));
+        }
+
+        let schema = self.schema.read();
+        let (logical_view, _) = Self::validate_materialized_view_contract(
+            &schema,
+            logical_view,
+            current_view,
+        )?;
+        let (_, replacement_view) = Self::validate_materialized_view_contract(
+            &schema,
+            &logical_view,
+            replacement_view,
+        )?;
+        if replacement_view != logical_view
+            && schema
+                .materialized_view_commit_order(std::slice::from_ref(&logical_view))?
+                .contains(&replacement_view)
+        {
+            return Err(LimboError::ParseError(format!(
+                "materialized view replacement would create a dependency cycle: {replacement_view} is downstream of {logical_view}"
+            )));
+        }
+        let dependent_views = schema.get_dependent_materialized_views(&logical_view);
+        drop(schema);
+
+        let mut correction = crate::incremental::dbsp::Delta::new();
+        for (rowid, values) in current_rows {
+            correction.delete(rowid, values);
+        }
+        for (rowid, values) in replacement_rows {
+            correction.insert(rowid, values);
+        }
+
+        if correction.is_empty() {
+            return Ok(0);
+        }
+
+        for dependent_view in &dependent_views {
+            self.view_transaction_states
+                .get_or_create(dependent_view)
+                .merge(&logical_view, &correction);
+        }
+
+        Ok(dependent_views.len())
+    }
+
+    /// Activate a physical view as the producer for dependants compiled against
+    /// `logical_view`. Passing the logical view itself removes the override.
+    pub fn activate_materialized_view_route(
+        &self,
+        logical_view: &str,
+        physical_view: &str,
+    ) -> Result<()> {
+        let schema = self.schema.read();
+        let (logical_view, physical_view) = Self::validate_materialized_view_contract(
+            &schema,
+            logical_view,
+            physical_view,
+        )?;
+
+        if physical_view != logical_view
+            && schema
+                .materialized_view_commit_order(std::slice::from_ref(&logical_view))?
+                .contains(&physical_view)
+        {
+            return Err(LimboError::ParseError(format!(
+                "materialized view replacement would create a dependency cycle: {physical_view} is downstream of {logical_view}"
+            )));
+        }
+        drop(schema);
+
+        let mut routes = self.materialized_view_routes.write();
+        if physical_view == logical_view {
+            routes.remove(&logical_view);
+        } else {
+            routes.insert(logical_view, physical_view);
+        }
+        Ok(())
+    }
+
+    /// Resolve where a materialized view's output delta must be delivered.
+    /// The input name remains logical because that is what the downstream DBSP
+    /// circuit was compiled against.
+    pub(crate) fn materialized_view_output_routes(
+        &self,
+        schema: &Schema,
+        physical_view: &str,
+    ) -> Vec<(String, String)> {
+        let physical_view = crate::util::normalize_ident(physical_view);
+        let routes = self.materialized_view_routes.read();
+        let logical_is_inactive = routes
+            .get(&physical_view)
+            .is_some_and(|active_view| active_view != &physical_view);
+        let mut output_routes = Vec::new();
+
+        if !logical_is_inactive {
+            output_routes.extend(
+                schema
+                    .get_dependent_materialized_views(&physical_view)
+                    .into_iter()
+                    .map(|dependent_view| (dependent_view, physical_view.clone())),
+            );
+        }
+
+        for (logical_view, active_view) in routes.iter() {
+            if active_view != &physical_view {
+                continue;
+            }
+            output_routes.extend(
+                schema
+                    .get_dependent_materialized_views(logical_view)
+                    .into_iter()
+                    .map(|dependent_view| (dependent_view, logical_view.clone())),
+            );
+        }
+
+        output_routes.sort();
+        output_routes.dedup();
+        output_routes
+    }
+
+    /// Return affected materialized views in the topological order of the
+    /// effective runtime graph, including logical-to-physical route overrides.
+    pub(crate) fn materialized_view_commit_order(
+        &self,
+        schema: &Schema,
+        roots: &[String],
+    ) -> Result<Vec<String>> {
+        let mut affected = HashSet::default();
+        let mut pending = VecDeque::new();
+
+        for root in roots {
+            let root = crate::util::normalize_ident(root);
+            if schema.is_materialized_view(&root) && affected.insert(root.clone()) {
+                pending.push_back(root);
+            }
+        }
+
+        while let Some(source) = pending.pop_front() {
+            for (dependent_view, _) in self.materialized_view_output_routes(schema, &source) {
+                if schema.is_materialized_view(&dependent_view)
+                    && affected.insert(dependent_view.clone())
+                {
+                    pending.push_back(dependent_view);
+                }
+            }
+        }
+
+        let mut indegrees: HashMap<String, usize> =
+            affected.iter().map(|view| (view.clone(), 0)).collect();
+
+        for source in &affected {
+            for (dependent_view, _) in self.materialized_view_output_routes(schema, source) {
+                if let Some(indegree) = indegrees.get_mut(&dependent_view) {
+                    *indegree += 1;
+                }
+            }
+        }
+
+        let mut ready: Vec<String> = indegrees
+            .iter()
+            .filter_map(|(view, indegree)| (*indegree == 0).then_some(view.clone()))
+            .collect();
+        ready.sort_by(|a, b| b.cmp(a));
+
+        let mut order = Vec::with_capacity(affected.len());
+        while let Some(view) = ready.pop() {
+            order.push(view.clone());
+
+            for (dependent_view, _) in self.materialized_view_output_routes(schema, &view) {
+                let Some(indegree) = indegrees.get_mut(&dependent_view) else {
+                    continue;
+                };
+                *indegree -= 1;
+                if *indegree == 0 {
+                    ready.push(dependent_view);
+                    ready.sort_by(|a, b| b.cmp(a));
+                }
+            }
+        }
+
+        if order.len() != affected.len() {
+            return Err(LimboError::ParseError(
+                "materialized view dependency cycle detected after applying runtime routes"
+                    .to_string(),
+            ));
+        }
+
+        Ok(order)
+    }
+
     fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {
         let was_reparsing = self.schema_reparse_in_progress.swap(true, Ordering::SeqCst);
         turso_assert!(

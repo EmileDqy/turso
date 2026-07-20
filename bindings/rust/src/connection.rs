@@ -68,6 +68,73 @@ impl Clone for Connection {
 }
 
 impl Connection {
+    async fn materialized_view_snapshot(
+        &self,
+        relation: &str,
+    ) -> Result<Vec<(i64, Vec<turso_sdk_kit::rsapi::Value>)>> {
+        if relation.is_empty()
+            || !relation
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(Error::Misuse(format!(
+                "unsafe materialized view name: {relation}"
+            )));
+        }
+
+        let mut rows = self.query(format!("SELECT rowid, * FROM {relation}"), ()).await?;
+        let column_count = rows.column_count();
+        let mut snapshot = Vec::new();
+
+        while let Some(row) = rows.next().await? {
+            let rowid = row.get::<i64>(0)?;
+            let mut values = Vec::with_capacity(column_count.saturating_sub(1));
+            for index in 1..column_count {
+                values.push(row.get_value(index)?.into());
+            }
+            snapshot.push((rowid, values));
+        }
+
+        Ok(snapshot)
+    }
+
+    /// Stage the correction delta for replacing one physical materialized view
+    /// with another while preserving downstream materialized views.
+    ///
+    /// This must run inside an explicit transaction. Commit the catalog change
+    /// first, then call [`Self::activate_materialized_view_route`].
+    pub async fn stage_materialized_view_replacement(
+        &self,
+        logical_view: &str,
+        current_view: &str,
+        replacement_view: &str,
+    ) -> Result<usize> {
+        self.maybe_handle_dangling_tx().await?;
+        let current_rows = self.materialized_view_snapshot(current_view).await?;
+        let replacement_rows = self.materialized_view_snapshot(replacement_view).await?;
+        self.get_inner_connection()?
+            .stage_materialized_view_replacement(
+                logical_view,
+                current_view,
+                current_rows,
+                replacement_view,
+                replacement_rows,
+            )
+            .map_err(Error::from)
+    }
+
+    /// Route future output deltas from `physical_view` into dependants compiled
+    /// against `logical_view`.
+    pub fn activate_materialized_view_route(
+        &self,
+        logical_view: &str,
+        physical_view: &str,
+    ) -> Result<()> {
+        self.get_inner_connection()?
+            .activate_materialized_view_route(logical_view, physical_view)
+            .map_err(Error::from)
+    }
+
     pub(crate) fn create(
         conn: Arc<turso_sdk_kit::rsapi::TursoConnection>,
         extra_io: Option<Arc<dyn Fn(Waker) -> Result<()> + Send + Sync>>,

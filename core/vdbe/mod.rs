@@ -1913,7 +1913,9 @@ impl Program {
                         }
                     }
 
-                    let views = schema.materialized_view_commit_order(&roots)?;
+                    let views = self
+                        .connection
+                        .materialized_view_commit_order(&schema, &roots)?;
 
                     state.view_delta_state = ViewDeltaCommitState::Processing {
                         views,
@@ -1959,17 +1961,18 @@ impl Program {
                         // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
                         match view.merge_delta(delta_set, pager.clone())? {
                             IOResult::Done(output_delta) => {
-                                let dependent_views =
-                                    schema.get_dependent_materialized_views(view_name);
+                                let output_routes = self
+                                    .connection
+                                    .materialized_view_output_routes(&schema, view_name);
                                 drop(view);
                                 drop(schema);
 
                                 if !output_delta.is_empty() {
-                                    for dependent_view in dependent_views {
+                                    for (dependent_view, input_name) in output_routes {
                                         self.connection
                                             .view_transaction_states
                                             .get_or_create(&dependent_view)
-                                            .merge(view_name, &output_delta);
+                                            .merge(&input_name, &output_delta);
                                     }
                                 }
 

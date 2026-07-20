@@ -952,6 +952,38 @@ impl TursoConnection {
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
     }
+
+    pub fn stage_materialized_view_replacement(
+        &self,
+        logical_view: &str,
+        current_view: &str,
+        current_rows: Vec<(i64, Vec<Value>)>,
+        replacement_view: &str,
+        replacement_rows: Vec<(i64, Vec<Value>)>,
+    ) -> Result<usize, TursoError> {
+        let _guard = self.concurrent_guard.try_use()?;
+        self.connection
+            .stage_materialized_view_replacement(
+                logical_view,
+                current_view,
+                current_rows,
+                replacement_view,
+                replacement_rows,
+            )
+            .map_err(TursoError::from)
+    }
+
+    pub fn activate_materialized_view_route(
+        &self,
+        logical_view: &str,
+        physical_view: &str,
+    ) -> Result<(), TursoError> {
+        let _guard = self.concurrent_guard.try_use()?;
+        self.connection
+            .activate_materialized_view_route(logical_view, physical_view)
+            .map_err(TursoError::from)
+    }
+
     pub fn last_insert_rowid(&self) -> i64 {
         self.connection.last_insert_rowid()
     }
